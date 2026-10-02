@@ -1,4 +1,8 @@
 import asyncio
+from contextvars import ContextVar
+from time import monotonic
+
+from config.register_map import build_register_map, format_register_value
 
 from PySide6.QtCore import QThread, Signal
 from pymodbus import FramerType
@@ -20,7 +24,9 @@ class ModbusWorker(QThread):
         self.config = config
         self.values = list(initial_values)
 
-        self._read_request_count = 0
+        self.register_map = build_register_map(config)
+        self._last_read_log = None
+        self._local_write = ContextVar("local_write", default=False)
         self._loop = None
         self._server = None
         self._simulation_task = None
@@ -47,6 +53,8 @@ class ModbusWorker(QThread):
         current_values,
         set_values,
     ):
+        if self._local_write.get():
+            return None
         if set_values is not None:
             for offset, value in enumerate(set_values):
                 changed_address = address + offset
@@ -57,19 +65,21 @@ class ModbusWorker(QThread):
 
                 self.register_changed.emit(changed_address, int_value)
 
-            self.communication_log.emit(
-                f"WRITE FC={function_code:#04x}, "
-                f"ADDR={address}, VALUES={list(set_values)}"
-            )
+                self._log_change(changed_address, int_value)
         else:
-            self._read_request_count += 1
-
-            if self._read_request_count == 1 or self._read_request_count % 15 == 0:
-                end_address = address + count - 1
-                self.communication_log.emit(
-                    f"POLL FC={function_code:#04x}, "
-                    f"ADDR={address}~{end_address}, COUNT={count}"
-                )
+            now = monotonic()
+            if self._last_read_log is None or now - self._last_read_log >= 10:
+                self._last_read_log = now
+                self.communication_log.emit("통신 요청을 정상적으로 받았습니다. 연결된 장치가 현재 값을 확인하고 있습니다.")
+                for read_address in range(address, address + count):
+                    register = self.register_map.get(read_address)
+                    if register and (read_address in (5, 6) or
+                                     register["name"].endswith("measured_potential")):
+                        if register.get("tb_number", 0) > self._active_tb_count:
+                            continue
+                        self.communication_log.emit(
+                            f"{register['label']}: {format_register_value(register, self.values[read_address])}입니다."
+                        )
 
         return None
 
@@ -79,15 +89,21 @@ class ModbusWorker(QThread):
         if address >= len(self.values) or self.values[address] == value:
             return
 
-        await self._server.async_setValues(
-            self.config["communication"]["slave_id"],
-            6,
-            address,
-            [value],
-        )
+        await self._write_local(address, value)
 
         self.values[address] = value
         self.register_changed.emit(address, value)
+
+    async def _write_local(self, address, value):
+        # Local model updates also invoke the pymodbus action callback.
+        # Keep them out of the external communication log.
+        token = self._local_write.set(True)
+        try:
+            await self._server.async_setValues(
+                self.config["communication"]["slave_id"], 6, address, [value]
+            )
+        finally:
+            self._local_write.reset(token)
 
     async def _simulation_loop(self):
         await self._update_register(4, self._rectifier.initial_input_voltage_raw())
@@ -110,21 +126,22 @@ class ModbusWorker(QThread):
                         await self._update_register(address, value)
 
                     if environment_result["mode_changed"]:
-                        self.communication_log.emit(
-                            f"ENV MODE={environment_result['mode']}, "
-                            f"V={updates[5] / 10.0:.1f}V, "
-                            f"I={environment_result['current']:.2f}A"
-                        )
+                        descriptions = {
+                            "MODEL": "학습 모델로 출력전류와 TB 측정전위를 계산하고 있습니다.",
+                            "FALLBACK": "학습 범위 밖의 전압이므로 대체 계산식으로 출력전류와 TB 측정전위를 계산하고 있습니다.",
+                            "OFF": "정류기 전원이 꺼져 잔류 출력 상태로 전환하고 있습니다.",
+                        }
+                        self.communication_log.emit(descriptions[environment_result["mode"]])
 
                 if (
                     power_status != self._previous_power_status
                     or updates["set_voltage"] != self._previous_set_voltage
                 ):
-                    state = "ON" if power_status == 1 else "OFF"
+                    state = "켜짐" if power_status == 1 else "꺼짐"
                     self.communication_log.emit(
-                        f"SIM POWER={state}, "
-                        f"SET={updates['set_voltage']:.1f}V, "
-                        f"TARGET={updates['target_voltage']:.1f}V"
+                        f"정류기 전원은 {state} 상태입니다. "
+                        f"설정전압은 {updates['set_voltage']:.1f} V, "
+                        f"출력 목표는 {updates['target_voltage']:.1f} V입니다."
                     )
                     self._previous_power_status = power_status
                     self._previous_set_voltage = updates["set_voltage"]
@@ -169,11 +186,12 @@ class ModbusWorker(QThread):
             stopbits=communication["stopbits"],
         )
 
+        await self._server.serve_forever(background=True)
         self.server_status.emit("RTU 서버 실행 중")
         self._simulation_task = asyncio.create_task(self._simulation_loop())
 
         try:
-            await self._server.serve_forever()
+            await self._server.serving
         finally:
             if self._simulation_task is not None:
                 self._simulation_task.cancel()
@@ -189,12 +207,7 @@ class ModbusWorker(QThread):
         address = int(address)
         value = int(value)
         future = asyncio.run_coroutine_threadsafe(
-            self._server.async_setValues(
-                self.config["communication"]["slave_id"],
-                6,
-                address,
-                [value],
-            ),
+            self._write_local(address, value),
             self._loop,
         )
 
@@ -204,10 +217,19 @@ class ModbusWorker(QThread):
                 if address < len(self.values):
                     self.values[address] = value
                 self.register_changed.emit(address, value)
+                self._log_change(address, value)
             except Exception as error:
                 self.server_error.emit(str(error))
 
         future.add_done_callback(completed)
+
+    def _log_change(self, address, value):
+        register = self.register_map.get(address)
+        if register is None:
+            return
+        self.communication_log.emit(
+            f"{register['label']} 변경 완료: {format_register_value(register, value)}."
+        )
 
     def stop_server(self):
         if self._loop is None or self._server is None:

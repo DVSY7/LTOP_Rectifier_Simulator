@@ -1,7 +1,7 @@
 from datetime import datetime
 from copy import deepcopy
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QComboBox,
@@ -14,12 +14,16 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 from serial.tools import list_ports
+
+from ui.output_graph import OutputGraph
+from ui.user_guide import COLOR_GUIDES, CONTROL_GUIDES, register_guide
 
 from communication.modbus_worker import ModbusWorker
 from communication.serial_ports import choose_port_index, format_port_label
@@ -45,11 +49,14 @@ class MainWindow(QMainWindow):
         self.server_control_widgets = []
 
         self.setWindowTitle("정류기 RTU 시뮬레이터")
-        self.resize(1100, 750)
+        self.resize(1200, 900)
         self._create_ui()
         self._rebuild_table()
         self._refresh_serial_ports()
         self._set_server_controls_enabled(False)
+        self.graph_timer = QTimer(self)
+        self.graph_timer.setInterval(1000)
+        self.graph_timer.timeout.connect(self._sample_graph)
 
     def _populate_combo(self, combo, address):
         values = self.register_map[address].get("values", {})
@@ -93,7 +100,7 @@ class MainWindow(QMainWindow):
 
         control_layout = QHBoxLayout()
 
-        control_layout.addWidget(QLabel("보드 상태"))
+        control_layout.addWidget(self._guide_button("보드 상태 ⓘ", CONTROL_GUIDES["보드 상태"]))
         self.board_status_combo = QComboBox()
         self._populate_combo(self.board_status_combo, 0)
         board_button = QPushButton("상태 적용")
@@ -102,7 +109,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(board_button)
 
         control_layout.addSpacing(20)
-        control_layout.addWidget(QLabel("정류기 전원"))
+        control_layout.addWidget(self._guide_button("정류기 전원 ⓘ", CONTROL_GUIDES["정류기 전원"]))
         self.power_status_combo = QComboBox()
         self._populate_combo(self.power_status_combo, 1)
         power_button = QPushButton("전원 적용")
@@ -111,7 +118,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(power_button)
 
         control_layout.addSpacing(20)
-        control_layout.addWidget(QLabel("운전 모드"))
+        control_layout.addWidget(self._guide_button("운전 모드 ⓘ", CONTROL_GUIDES["운전 모드"]))
         self.control_mode_combo = QComboBox()
         self._populate_combo(self.control_mode_combo, 2)
         mode_button = QPushButton("모드 적용")
@@ -120,7 +127,7 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(mode_button)
 
         control_layout.addSpacing(20)
-        control_layout.addWidget(QLabel("활성 TB 수"))
+        control_layout.addWidget(self._guide_button("활성 TB 수 ⓘ", CONTROL_GUIDES["활성 TB 수"]))
         self.tb_count_spin = QSpinBox()
         self.tb_count_spin.setRange(0, self.config["tb"]["max_count"])
         self.tb_count_spin.setValue(self.active_tb_count)
@@ -149,7 +156,7 @@ class MainWindow(QMainWindow):
             ("  직접 입력 가능  ", "#FFF4CC"),
             ("  모델 자동 계산  ", "#E6E6E6"),
         ):
-            label = QLabel(text)
+            label = self._guide_button(text.strip() + " ⓘ", COLOR_GUIDES[text.strip()])
             label.setStyleSheet(f"background-color: {color}; padding: 4px;")
             legend_layout.addWidget(label)
         legend_layout.addStretch()
@@ -164,18 +171,51 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.cellDoubleClicked.connect(self._edit_register_value)
-        root_layout.addWidget(self.table)
+        self.table.cellClicked.connect(self._show_register_guide)
+        for column in (2, 3):
+            self.table.setColumnHidden(column, True)
+        self.table.setHorizontalHeaderLabels(["주소", "항목", "R/W", "Raw 값", "현재 값"])
+        self.table.setColumnWidth(4, 170)
+        self.guide_text = QLabel("사용 안내\n위쪽 색상 버튼이나 표의 항목을 클릭하면 설명이 표시됩니다.\n\n1. 통신 포트를 선택하고 서버를 시작합니다.\n2. 노란색 값을 더블클릭하거나 상단에서 상태를 적용합니다.\n3. 그래프 목록의 체크를 켜고 꺼서 표시 항목을 선택합니다.")
+        self.guide_text.setWordWrap(True)
+        self.guide_text.setAlignment(Qt.AlignTop)
+        self.guide_text.setMinimumWidth(220)
+        self.guide_text.setStyleSheet("background: #F1F6FC; padding: 16px; color: #24354B;")
+        table_split = QSplitter(Qt.Horizontal)
+        table_split.addWidget(self.table)
+        table_split.addWidget(self.guide_text)
+        table_split.setSizes([820, 330])
+        self.content_split = QSplitter(Qt.Vertical)
+        self.content_split.addWidget(table_split)
+        self.graph = OutputGraph(self.register_map)
+        self.content_split.addWidget(self.graph)
+        self.content_split.setSizes([320, 330])
+        root_layout.addWidget(self.content_split, 1)
 
-        root_layout.addWidget(QLabel("Modbus 통신 로그"))
+        root_layout.addWidget(QLabel("통신 및 동작 기록"))
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(180)
+        self.log_text.setMaximumHeight(90)
         self.log_text.document().setMaximumBlockCount(500)
         self.log_text.setPlaceholderText(
-            "산업용 PC의 Modbus 요청을 기다리는 중입니다."
+            "서버를 시작하면 통신 및 설정 변경 내용이 표시됩니다."
         )
         root_layout.addWidget(self.log_text)
         self.setCentralWidget(central_widget)
+
+    def _guide_button(self, title, description):
+        button = QPushButton(title)
+        button.setToolTip("클릭하면 사용 안내를 표시합니다.")
+        button.clicked.connect(lambda: self.guide_text.setText(description))
+        return button
+
+    def _show_register_guide(self, row, column):
+        address = int(self.table.item(row, 0).text())
+        self.guide_text.setText(register_guide(self.register_map[address]))
+
+    def _sample_graph(self):
+        if self.worker is not None:
+            self.graph.sample(self.register_values)
 
     def _refresh_serial_ports(self):
         """연결 가능한 직렬 포트를 다시 검색하고 적절한 포트를 선택한다."""
@@ -230,6 +270,7 @@ class MainWindow(QMainWindow):
 
         worker_config = deepcopy(self.config)
         worker_config["communication"]["port"] = selected_port
+        worker_config["tb"]["active_count"] = self.active_tb_count
         self.settings.setValue("last_serial_port", selected_port)
 
         worker = ModbusWorker(worker_config, self.register_values)
@@ -245,7 +286,7 @@ class MainWindow(QMainWindow):
         self.start_server_button.setEnabled(False)
         self.stop_server_button.setEnabled(True)
         self.status_label.setText("서버 시작 중...")
-        self._update_log(f"SERVER START PORT={selected_port}")
+        self._update_log(f"{selected_port}에서 통신을 시작하고 있습니다.")
         worker.start()
 
     def _stop_server(self):
@@ -267,6 +308,10 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         if message == "RTU 서버 실행 중":
             self._set_server_controls_enabled(True)
+            self.graph.clear()
+            self.graph.sample(self.register_values)
+            self.graph_timer.start()
+            self._update_log("서버가 시작되었습니다. 연결된 장치의 통신 요청을 기다립니다.")
 
     def _on_worker_finished(self):
         worker = self.sender()
@@ -274,6 +319,7 @@ class MainWindow(QMainWindow):
             return
         selected_port = self.port_combo.currentData()
         self.worker = None
+        self.graph_timer.stop()
         worker.deleteLater()
         self._set_server_controls_enabled(False)
         self.port_combo.setEnabled(True)
@@ -281,7 +327,7 @@ class MainWindow(QMainWindow):
         self.start_server_button.setEnabled(self.port_combo.currentData() is not None)
         self.stop_server_button.setEnabled(False)
         self.status_label.setText("서버 정지")
-        self._update_log(f"SERVER STOP PORT={selected_port}")
+        self._update_log(f"{selected_port} 통신 서버가 정지되었습니다. 그래프 기록을 멈춥니다.")
 
     def _require_worker(self):
         if self.worker is None:
@@ -303,6 +349,7 @@ class MainWindow(QMainWindow):
 
     def _rebuild_table(self):
         registers = self._visible_registers()
+        self.graph.set_active_registers(registers)
         self.table.setRowCount(len(registers))
         self.row_by_address.clear()
 
@@ -372,9 +419,7 @@ class MainWindow(QMainWindow):
         if worker is None:
             return
         worker.set_register(address, raw_value)
-        self._update_log(
-            f"MANUAL ADDR={address}, VALUE={value}{unit}, RAW={raw_value}"
-        )
+
 
     def _update_register(self, address, value):
         if address >= len(self.register_values):
@@ -411,9 +456,7 @@ class MainWindow(QMainWindow):
             return
         value = self.power_status_combo.currentData()
         worker.set_register(1, value)
-        self._update_log(
-            f"MANUAL ADDR=1, POWER={self.register_map[1]['values'].get(value)}"
-        )
+
 
     def _apply_control_mode(self):
         worker = self._require_worker()
@@ -421,8 +464,6 @@ class MainWindow(QMainWindow):
             return
         value = self.control_mode_combo.currentData()
         worker.set_register(2, value)
-        mode = self.register_map[2]["values"].get(value, f"알 수 없음({value})")
-        self._update_log(f"MANUAL ADDR=2, MODE={mode}")
 
     def _apply_tb_count(self):
         worker = self._require_worker()
@@ -449,6 +490,7 @@ class MainWindow(QMainWindow):
         self.active_tb_count = new_count
         worker.set_active_tb_count(new_count)
         self._rebuild_table()
+        self._update_log(f"활성 TB 수가 {new_count}개로 변경되었습니다.")
 
     def _update_log(self, message):
         current_time = datetime.now().strftime("%H:%M:%S")
@@ -457,7 +499,12 @@ class MainWindow(QMainWindow):
         scroll_bar.setValue(scroll_bar.maximum())
 
     def _show_error(self, message):
-        QMessageBox.critical(self, "Modbus RTU 오류", message)
+        self._update_log("통신 또는 시뮬레이션에 문제가 발생했습니다. 포트 연결과 설정을 확인해 주세요.")
+        dialog = QMessageBox(QMessageBox.Critical, "통신 / 시뮬레이션 오류",
+                             "정상적으로 처리하지 못했습니다. 통신 포트와 연결 상태를 확인해 주세요.",
+                             parent=self)
+        dialog.setDetailedText(message)
+        dialog.exec()
 
     def closeEvent(self, event):
         if self.worker is not None:

@@ -14,6 +14,7 @@ def test_rectifier_and_tb_register_addresses():
 
 def test_explore_mode_and_initial_values():
     config = load_config()
+    config["tb"]["active_count"] = 2
     register_map = build_register_map(config)
     values = build_initial_values(config, register_map)
 
