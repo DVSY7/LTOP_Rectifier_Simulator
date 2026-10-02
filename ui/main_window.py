@@ -206,12 +206,16 @@ class MainWindow(QMainWindow):
     def _guide_button(self, title, description):
         button = QPushButton(title)
         button.setToolTip("클릭하면 사용 안내를 표시합니다.")
-        button.clicked.connect(lambda: self.guide_text.setText(description))
+        button.clicked.connect(lambda: self._set_guide(description))
         return button
+
+    def _set_guide(self, guide):
+        name, _, description = guide.partition("\n")
+        self.guide_text.setText(f"명칭: {name}\n\n설명: {description}")
 
     def _show_register_guide(self, row, column):
         address = int(self.table.item(row, 0).text())
-        self.guide_text.setText(register_guide(self.register_map[address]))
+        self._set_guide(register_guide(self.register_map[address]))
 
     def _sample_graph(self):
         if self.worker is not None:
